@@ -1,0 +1,8 @@
+[package]
+name = "rugmat"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+rug = "1.21"
+faer = "0.15"
