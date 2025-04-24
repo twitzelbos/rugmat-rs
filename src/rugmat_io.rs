@@ -1,6 +1,7 @@
 // rugmat-io.rs: file I/O and checksum for RugMat
 use crate::RugMat;
-use rug::{Float, float::Round};
+use crate::float_serializer::{read_float, write_float};
+use rug::Float;
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Write};
 
@@ -16,16 +17,16 @@ impl RugMat {
         writer.write_all(&[RUGMAT_VERSION])?;
         writer.write_all(&(self.rows as u64).to_le_bytes())?;
         writer.write_all(&(self.cols as u64).to_le_bytes())?;
-        writer.write_all(&(self.data[0].precision() as u32).to_le_bytes())?;
 
         let mut hasher = blake3::Hasher::new();
+        let mut temp_buf = Vec::new();
 
         for f in &self.data {
-            let bytes = f.to_digits::<u8>(Round::Nearest).1;
-            writer.write_all(&(bytes.len() as u64).to_le_bytes())?;
-            writer.write_all(&bytes)?;
-            hasher.update(&(bytes.len() as u64).to_le_bytes());
-            hasher.update(&bytes);
+            temp_buf.clear();
+            write_float(&mut temp_buf, f)?;
+            hasher.update(&temp_buf);
+            writer.write_all(&(temp_buf.len() as u64).to_le_bytes())?;
+            writer.write_all(&temp_buf)?;
         }
 
         let checksum = hasher.finalize();
@@ -56,14 +57,10 @@ impl RugMat {
         }
 
         let mut buf8 = [0u8; 8];
-        let mut buf4 = [0u8; 4];
-
         reader.read_exact(&mut buf8)?;
         let rows = u64::from_le_bytes(buf8) as usize;
         reader.read_exact(&mut buf8)?;
         let cols = u64::from_le_bytes(buf8) as usize;
-        reader.read_exact(&mut buf4)?;
-        let precision = u32::from_le_bytes(buf4);
 
         let mut data = Vec::with_capacity(rows * cols);
         let mut hasher = blake3::Hasher::new();
@@ -71,11 +68,10 @@ impl RugMat {
         for _ in 0..(rows * cols) {
             reader.read_exact(&mut buf8)?;
             let len = u64::from_le_bytes(buf8) as usize;
-            let mut bytes = vec![0u8; len];
-            reader.read_exact(&mut bytes)?;
-            hasher.update(&buf8);
-            hasher.update(&bytes);
-            let f = Float::with_val(precision, rug::float::Parse::from_digits(&bytes, 256));
+            let mut temp_buf = vec![0u8; len];
+            reader.read_exact(&mut temp_buf)?;
+            hasher.update(&temp_buf);
+            let f = read_float(&mut &temp_buf[..])?;
             data.push(f);
         }
 
