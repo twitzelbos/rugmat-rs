@@ -1,7 +1,15 @@
 use faer::prelude::*;
 use rayon::prelude::*;
+use rug::Assign;
 use rug::Float; // or faer::Mat if needed directly
+use rug::ops::CompleteRound;
 use std::ops::{Index, IndexMut};
+
+pub enum PseudoInverseAlgorithm {
+    GradientDescent { alpha: Float },
+    LSQR,
+    ConjugateGradient,
+}
 
 #[derive(Debug)]
 pub struct SVD {
@@ -98,6 +106,36 @@ impl IndexMut<(usize, usize)> for RugMat {
     }
 }
 
+pub fn dot(a: &[Float], b: &[Float]) -> Float {
+    assert_eq!(a.len(), b.len());
+    let precision = a[0].prec().max(b[0].prec());
+    let mut acc = Float::with_val(precision, 0);
+    for (x, y) in a.iter().zip(b.iter()) {
+        acc += x * y;
+    }
+    acc
+}
+
+pub fn norm2(a: &[Float]) -> Float {
+    let precision = a[0].prec();
+    let mut acc = Float::with_val(precision, 0);
+    for x in a {
+        acc += x * x;
+    }
+    acc
+}
+
+/// Reuse buffer: subtract `b` from `a` and store in `out`
+pub fn vec_sub_in_place(a: &[Float], b: &[Float], out: &mut [Float]) {
+    assert_eq!(a.len(), b.len());
+    assert_eq!(a.len(), out.len());
+
+    for i in 0..a.len() {
+        out[i].assign(&a[i]);
+        out[i] -= &b[i];
+    }
+}
+
 impl RugMat {
     pub fn matmul(&self, other: &RugMat) -> RugMat {
         assert_eq!(self.cols, other.rows);
@@ -166,6 +204,369 @@ impl RugMat {
                 sum
             })
             .collect()
+    }
+
+    pub fn dot_columns(&self, i: usize, j: usize) -> Float {
+        let precision = self[(0, i)].prec().max(self[(0, j)].prec());
+        let mut acc = Float::with_val(precision, 0);
+        for row in 0..self.rows {
+            acc += &self[(row, i)] * &self[(row, j)];
+        }
+        acc
+    }
+
+    pub fn column_norm2(&self, j: usize) -> Float {
+        let precision = self[(0, j)].prec();
+        let mut acc = Float::with_val(precision, 0);
+        for row in 0..self.rows {
+            let x = &self[(row, j)];
+            acc += x * x;
+        }
+        acc
+    }
+
+    /// Infinity norm (max absolute row sum), optimized for column-major layout with Rayon
+    pub fn norm_inf(&self) -> Float {
+        let precision = self.data[0].prec();
+        let rows = self.rows;
+        let cols = self.cols;
+
+        // Parallel over columns, accumulate per-row values
+        let row_sums = (0..cols)
+            .into_par_iter()
+            .map_init(
+                || vec![Float::with_val(precision, 0); rows],
+                |local_row_sums, j| {
+                    let mut tmp = Float::with_val(precision, 0);
+                    for i in 0..rows {
+                        tmp.assign(&self[(i, j)]);
+                        tmp.abs_mut();
+                        local_row_sums[i] += &tmp;
+                    }
+                    local_row_sums.clone()
+                },
+            )
+            .reduce(
+                || vec![Float::with_val(precision, 0); rows],
+                |mut acc, other| {
+                    for i in 0..rows {
+                        acc[i] += &other[i];
+                    }
+                    acc
+                },
+            );
+
+        row_sums
+            .into_iter()
+            .reduce(|a, b| if a > b { a } else { b })
+            .unwrap()
+    }
+}
+
+use crate::float_serializer::{read_float, write_float};
+use rayon::prelude::*;
+use rug::float::Round;
+use std::fs::File;
+use std::io::{BufReader, BufWriter, Read, Write};
+
+impl RugMat {
+    /// Compute 2-norm of a vector
+    pub fn norm2_vec(v: &[Float]) -> Float {
+        let precision = v[0].prec();
+        let mut acc = Float::with_val(precision * 2, 0);
+        for x in v {
+            acc += x * x;
+        }
+        acc.sqrt()
+    }
+
+    /// Solve A x = b approximately using the specified algorithm
+    pub fn pseudo_inverse_solve(
+        &self,
+        b: &[Float],
+        iters: usize,
+        alg: PseudoInverseAlgorithm,
+    ) -> Vec<Float> {
+        match alg {
+            PseudoInverseAlgorithm::GradientDescent { alpha } => {
+                let precision = b[0].precision();
+                let mut x = vec![Float::with_val(precision, 0); self.cols];
+
+                for _ in 0..iters {
+                    let Ax = self.matmul_vec(&x);
+                    let mut r = vec![Float::with_val(precision, 0); self.rows];
+                    for i in 0..self.rows {
+                        r[i] = Ax[i].clone() - &b[i];
+                    }
+                    let At_r = Transpose::new(self).mul(&r);
+                    for j in 0..self.cols {
+                        x[j] -= &alpha * &At_r[j];
+                    }
+                }
+                x
+            }
+            PseudoInverseAlgorithm::LSQR => self.lsqr(b, iters),
+            PseudoInverseAlgorithm::ConjugateGradient => self.conjugate_gradient(b, iters),
+        }
+    }
+
+    pub fn conjugate_gradient(&self, b: &[Float], max_iters: usize) -> Vec<Float> {
+        let precision = b[0].precision();
+
+        // Normal equations: AᵗA x = Aᵗb
+        let At_b = Transpose::new(self).mul(b);
+        let mut x = vec![Float::with_val(precision, 0); self.cols];
+
+        let Ax = self.matmul_vec(&x);
+        let At_Ax = Transpose::new(self).mul(&Ax);
+
+        let mut r: Vec<Float> = At_b.iter().zip(&At_Ax).map(|(b, ax)| b - ax).collect();
+        let mut p = r.clone();
+        let mut rs_old = r.iter().map(|v| v * v).reduce(|a, b| a + b).unwrap();
+
+        let initial_norm = rs_old.clone().sqrt();
+        let epsilon = Float::with_val(precision, 1e-30);
+        let mut restart_regularized = false;
+
+        for iter in 0..max_iters {
+            let Ap = {
+                let Av = self.matmul_vec(&p);
+                Transpose::new(self).mul(&Av)
+            };
+            let denom = p
+                .iter()
+                .zip(&Ap)
+                .map(|(a, b)| a * b)
+                .reduce(|a, b| a + b)
+                .unwrap();
+
+            if denom == 0 {
+                // Likely rank deficiency
+                if !restart_regularized {
+                    eprintln!(
+                        "[CG] Detected possible rank deficiency at iter {} — restarting with Tikhonov regularization",
+                        iter
+                    );
+                    return self.cg_regularized(b, max_iters, Float::with_val(precision, 1e-10));
+                } else {
+                    break;
+                }
+            }
+
+            let alpha = &rs_old / &denom;
+
+            for i in 0..x.len() {
+                x[i] += &alpha * &p[i];
+                r[i] -= &alpha * &Ap[i];
+            }
+
+            let rs_new = r.iter().map(|v| v * v).reduce(|a, b| a + b).unwrap();
+            if rs_new < &epsilon * &initial_norm {
+                break;
+            }
+
+            let beta = &rs_new / &rs_old;
+            for i in 0..p.len() {
+                p[i] = &r[i] + &beta * &p[i];
+            }
+            rs_old = rs_new;
+        }
+        x
+    }
+
+    /// Regularized CG: Solve (AᵗA + λI)x = Aᵗb
+    pub fn cg_regularized(&self, b: &[Float], max_iters: usize, lambda: Float) -> Vec<Float> {
+        let precision = b[0].precision();
+
+        let At_b = Transpose::new(self).mul(b);
+        let mut x = vec![Float::with_val(precision, 0); self.cols];
+
+        let Ax = self.matmul_vec(&x);
+        let At_Ax = Transpose::new(self).mul(&Ax);
+
+        let mut r: Vec<Float> = At_b.iter().zip(&At_Ax).map(|(b, ax)| b - ax).collect();
+        for (ri, xi) in r.iter_mut().zip(&x) {
+            *ri -= &lambda * xi;
+        }
+
+        let mut p = r.clone();
+        let mut rs_old = r.iter().map(|v| v * v).reduce(|a, b| a + b).unwrap();
+
+        for _ in 0..max_iters {
+            let Ap = {
+                let Av = self.matmul_vec(&p);
+                let AtAv = Transpose::new(self).mul(&Av);
+                AtAv.into_iter()
+                    .zip(&p)
+                    .map(|(val, pi)| val + &lambda * pi)
+                    .collect::<Vec<_>>()
+            };
+            let denom = p
+                .iter()
+                .zip(&Ap)
+                .map(|(a, b)| a * b)
+                .reduce(|a, b| a + b)
+                .unwrap();
+            let alpha = &rs_old / &denom;
+
+            for i in 0..x.len() {
+                x[i] += &alpha * &p[i];
+                r[i] -= &alpha * &Ap[i];
+            }
+
+            let rs_new = r.iter().map(|v| v * v).reduce(|a, b| a + b).unwrap();
+            if rs_new < Float::with_val(precision, 1e-30) {
+                break;
+            }
+            let beta = &rs_new / &rs_old;
+            for i in 0..p.len() {
+                p[i] = &r[i] + &beta * &p[i];
+            }
+            rs_old = rs_new;
+        }
+        x
+    }
+
+    /// LSQR algorithm to solve A x ≈ b
+    pub fn lsqr(&self, b: &[Float], max_iters: usize) -> Vec<Float> {
+        let precision = b[0].precision();
+        let mut x = vec![Float::with_val(precision, 0); self.cols];
+        let mut u = b.to_vec();
+        let beta = Self::norm2_vec(&u);
+        for ui in &mut u {
+            *ui /= &beta;
+        }
+
+        let mut v = Transpose::new(self).mul(&u);
+        let alpha = Self::norm2_vec(&v);
+        for vi in &mut v {
+            *vi /= &alpha;
+        }
+
+        let mut w = v.clone();
+        let mut phibar = beta.clone();
+        let mut rhobar = alpha.clone();
+
+        for _ in 0..max_iters {
+            let mut u_new = self.matmul_vec(&v);
+            for (u_newi, ui) in u_new.iter_mut().zip(&u) {
+                *u_newi -= alpha.clone() * ui;
+            }
+            let beta = Self::norm2_vec(&u_new);
+            for ui in &mut u_new {
+                *ui /= &beta;
+            }
+            u = u_new;
+
+            let mut v_new = Transpose::new(self).mul(&u);
+            for (v_newi, vi) in v_new.iter_mut().zip(&v) {
+                *v_newi -= beta.clone() * vi;
+            }
+            let alpha = Self::norm2_vec(&v_new);
+            for vi in &mut v_new {
+                *vi /= &alpha;
+            }
+            v = v_new;
+
+            let rho = (rhobar.clone().square() + beta.clone().square()).sqrt();
+            let c = rhobar.clone() / &rho;
+            let s = beta / &rho;
+            let theta = s.clone() * &alpha;
+            rhobar = -c.clone() * alpha;
+            let phi = c * phibar.clone();
+            phibar = s * phibar;
+
+            for j in 0..x.len() {
+                x[j] += &phi * &w[j];
+            }
+            for j in 0..w.len() {
+                w[j] = &v[j] - &theta * &w[j];
+            }
+        }
+
+        x
+    }
+
+    /// Estimate the largest singular value (spectral norm) using power iteration
+    pub fn spectral_norm_estimate(&self, max_iters: usize, tol: f64) -> Float {
+        let precision = self.data[0].prec();
+        let mut x = vec![Float::with_val(precision, 1); self.cols];
+        let mut lambda = Float::with_val(precision, 0);
+
+        for _ in 0..max_iters {
+            let y = self.matmul_vec(&x);
+            let norm_y = Self::norm2_vec(&y);
+            for i in 0..self.cols {
+                x[i] = y[i].clone() / &norm_y;
+            }
+            let y2 = self.matmul_vec(&x);
+            let lambda_new = y
+                .iter()
+                .zip(&y2)
+                .map(|(a, b)| a * b)
+                .reduce(|a, b| a + b)
+                .unwrap();
+            if (&lambda_new - &lambda).abs() < Float::with_val(precision, tol) {
+                return lambda_new;
+            }
+            lambda.assign(lambda_new);
+        }
+        lambda
+    }
+
+    /// Estimate the smallest singular value using inverse power iteration with gradient solve
+    pub fn smallest_singular_value_estimate(&self, max_iters: usize, tol: f64) -> Float {
+        let precision = self.data[0].prec();
+        let mut x = vec![Float::with_val(precision, 1); self.rows];
+        let mut lambda = Float::with_val(precision, 0);
+
+        for _ in 0..max_iters {
+            let y = self.pseudo_inverse_solve(&x, 20, 0.01);
+            let norm_y = Self::norm2_vec(&y);
+            for i in 0..self.cols {
+                x[i] = y[i].clone() / &norm_y;
+            }
+            let Ax = self.matmul_vec(&x);
+            let lambda_new = x
+                .iter()
+                .zip(&Ax)
+                .map(|(a, b)| a * b)
+                .reduce(|a, b| a + b)
+                .unwrap();
+            if (&lambda_new - &lambda).abs() < Float::with_val(precision, tol) {
+                return lambda_new;
+            }
+            lambda.assign(lambda_new);
+        }
+        lambda
+    }
+
+    /// Estimate the condition number based on spectral and inverse estimates
+    pub fn cond_estimate(&self, max_iters: usize, tol: f64) -> Float {
+        let precision = self.data[0].prec();
+        let sigma_max = self.spectral_norm_estimate(max_iters, tol);
+        let sigma_min = self.smallest_singular_value_estimate(max_iters, tol);
+        // TODO: Panic might not be the best way to handle this as singular matrices can totally occur
+        if sigma_min.is_zero() {
+            panic!("Singular matrix detected: smallest singular value is zero.");
+        }
+
+        Float::with_val(precision, &sigma_max / &sigma_min)
+    }
+
+    /// Estimate required bit precision to achieve `bits` of accurate output
+    /// given a condition number estimate.
+    ///
+    /// Based on the fact that numerical error in solving Ax = b is amplified
+    /// by the condition number κ = cond(A), we may lose up to log2(κ) bits of
+    /// effective precision. To achieve `bits` of final result accuracy, we need:
+    ///
+    ///     required_bits = bits + ceil(log2(cond))
+    ///
+    /// This function returns that estimate.
+    pub fn required_precision_for_cond(bits: usize, cond_estimate: &Float) -> usize {
+        let extra = cond_estimate.clone().log2().ceil().to_integer().unwrap();
+        bits + extra.to_usize_wrapping()
     }
 }
 
@@ -313,19 +714,6 @@ impl RugMat {
         x
     }
 
-    /// Infinity norm (max absolute row sum)
-    pub fn norm_inf(&self) -> Float {
-        let precision = self.data[0][0].precision();
-        self.data
-            .iter()
-            .map(|row| {
-                row.iter()
-                    .map(|x| x.clone().abs())
-                    .fold(Float::with_val(precision, 0), |acc, v| acc + v)
-            })
-            .max()
-            .unwrap()
-    }
 
     /// Estimate condition number in infinity norm: ||A|| * ||A⁻¹|| (estimated)
     pub fn condition_number(&self) -> Float {
@@ -404,17 +792,6 @@ impl RugMat {
         }
 
         (q, r)
-    }
-
-    fn dot(u: &[Float], v: &[Float], precision: u32) -> Float {
-        u.iter()
-            .zip(v)
-            .map(|(a, b)| a * b)
-            .fold(Float::with_val(precision, 0), |acc, x| acc + x)
-    }
-
-    fn norm2(v: &[Float], precision: u32) -> Float {
-        dot(v, v, precision).sqrt()
     }
 
     /// Estimates eigenvalues of a symmetric matrix using QR iterations
