@@ -11,11 +11,43 @@ pub enum PseudoInverseAlgorithm {
     ConjugateGradient,
 }
 
+#[macro_export]
+macro_rules! t {
+    ($mat:expr) => {
+        Transpose::new(&$mat)
+    };
+}
 #[derive(Debug)]
 pub struct SVD {
     pub u: RugMat,
     pub s: Vec<Float>,
     pub vt: RugMat,
+}
+
+pub struct Transpose<'a> {
+    pub mat: &'a RugMat,
+}
+
+impl<'a> Transpose<'a> {
+    pub fn new(mat: &'a RugMat) -> Self {
+        Transpose { mat }
+    }
+
+    pub fn mul(&self, x: &[Float]) -> Vec<Float> {
+        self.mat.matmul_transpose_vec(x)
+    }
+
+    pub fn rows(&self) -> usize {
+        self.mat.cols
+    }
+
+    pub fn cols(&self) -> usize {
+        self.mat.rows
+    }
+
+    pub fn get(&self, i: usize, j: usize) -> &Float {
+        &self.mat[(j, i)]
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -289,7 +321,7 @@ impl RugMat {
     ) -> Vec<Float> {
         match alg {
             PseudoInverseAlgorithm::GradientDescent { alpha } => {
-                let precision = b[0].precision();
+                let precision = b[0].prec();
                 let mut x = vec![Float::with_val(precision, 0); self.cols];
 
                 for _ in 0..iters {
@@ -298,7 +330,7 @@ impl RugMat {
                     for i in 0..self.rows {
                         r[i] = Ax[i].clone() - &b[i];
                     }
-                    let At_r = Transpose::new(self).mul(&r);
+                    let At_r = t!(self).mul(&r);
                     for j in 0..self.cols {
                         x[j] -= &alpha * &At_r[j];
                     }
@@ -311,18 +343,26 @@ impl RugMat {
     }
 
     pub fn conjugate_gradient(&self, b: &[Float], max_iters: usize) -> Vec<Float> {
-        let precision = b[0].precision();
+        let precision = b[0].prec();
 
         // Normal equations: AᵗA x = Aᵗb
-        let At_b = Transpose::new(self).mul(b);
+        let At_b = t!(self).mul(b);
         let mut x = vec![Float::with_val(precision, 0); self.cols];
 
         let Ax = self.matmul_vec(&x);
-        let At_Ax = Transpose::new(self).mul(&Ax);
+        let At_Ax = t!(self).mul(&Ax);
 
-        let mut r: Vec<Float> = At_b.iter().zip(&At_Ax).map(|(b, ax)| b - ax).collect();
+        let mut r: Vec<Float> = At_b
+            .iter()
+            .zip(&At_Ax)
+            .map(|(b, ax)| (b - ax).complete(b.prec()))
+            .collect();
         let mut p = r.clone();
-        let mut rs_old = r.iter().map(|v| v * v).reduce(|a, b| a + b).unwrap();
+        let mut rs_old = r
+            .iter()
+            .map(|v| (v * v).complete(v.prec()))
+            .reduce(|a, b| (a + b))
+            .unwrap();
 
         let initial_norm = rs_old.clone().sqrt();
         let epsilon = Float::with_val(precision, 1e-30);
@@ -331,12 +371,12 @@ impl RugMat {
         for iter in 0..max_iters {
             let Ap = {
                 let Av = self.matmul_vec(&p);
-                Transpose::new(self).mul(&Av)
+                t!(self).mul(&Av)
             };
             let denom = p
                 .iter()
                 .zip(&Ap)
-                .map(|(a, b)| a * b)
+                .map(|(a, b)| (a * b).complete(a.prec()))
                 .reduce(|a, b| a + b)
                 .unwrap();
 
@@ -353,21 +393,25 @@ impl RugMat {
                 }
             }
 
-            let alpha = &rs_old / &denom;
+            let alpha = (&rs_old / &denom).complete(rs_old.prec());
 
             for i in 0..x.len() {
                 x[i] += &alpha * &p[i];
                 r[i] -= &alpha * &Ap[i];
             }
 
-            let rs_new = r.iter().map(|v| v * v).reduce(|a, b| a + b).unwrap();
-            if rs_new < &epsilon * &initial_norm {
+            let rs_new = r
+                .iter()
+                .map(|v| (v * v).complete(v.prec()))
+                .reduce(|a, b| a + b)
+                .unwrap();
+            if rs_new < (&epsilon * &initial_norm).complete(epsilon.prec()) {
                 break;
             }
 
-            let beta = &rs_new / &rs_old;
+            let beta = (&rs_new / &rs_old).complete(rs_new.prec());
             for i in 0..p.len() {
-                p[i] = &r[i] + &beta * &p[i];
+                p[i] = (&r[i] + (&beta * &p[i]).complete(beta.prec()));
             }
             rs_old = rs_new;
         }
@@ -376,26 +420,34 @@ impl RugMat {
 
     /// Regularized CG: Solve (AᵗA + λI)x = Aᵗb
     pub fn cg_regularized(&self, b: &[Float], max_iters: usize, lambda: Float) -> Vec<Float> {
-        let precision = b[0].precision();
+        let precision = b[0].prec();
 
-        let At_b = Transpose::new(self).mul(b);
+        let At_b = t!(self).mul(b);
         let mut x = vec![Float::with_val(precision, 0); self.cols];
 
         let Ax = self.matmul_vec(&x);
-        let At_Ax = Transpose::new(self).mul(&Ax);
+        let At_Ax = t!(self).mul(&Ax);
 
-        let mut r: Vec<Float> = At_b.iter().zip(&At_Ax).map(|(b, ax)| b - ax).collect();
+        let mut r: Vec<Float> = At_b
+            .iter()
+            .zip(&At_Ax)
+            .map(|(b, ax)| (b - ax).complete(b.prec()))
+            .collect();
         for (ri, xi) in r.iter_mut().zip(&x) {
             *ri -= &lambda * xi;
         }
 
         let mut p = r.clone();
-        let mut rs_old = r.iter().map(|v| v * v).reduce(|a, b| a + b).unwrap();
+        let mut rs_old = r
+            .iter()
+            .map(|v| (v * v).complete(v.prec()))
+            .reduce(|a, b| a + b)
+            .unwrap();
 
         for _ in 0..max_iters {
             let Ap = {
                 let Av = self.matmul_vec(&p);
-                let AtAv = Transpose::new(self).mul(&Av);
+                let AtAv = t!(self).mul(&Av);
                 AtAv.into_iter()
                     .zip(&p)
                     .map(|(val, pi)| val + &lambda * pi)
@@ -404,23 +456,27 @@ impl RugMat {
             let denom = p
                 .iter()
                 .zip(&Ap)
-                .map(|(a, b)| a * b)
+                .map(|(a, b)| (a * b).complete(a.prec()))
                 .reduce(|a, b| a + b)
                 .unwrap();
-            let alpha = &rs_old / &denom;
+            let alpha = (&rs_old / &denom).complete(rs_old.prec());
 
             for i in 0..x.len() {
                 x[i] += &alpha * &p[i];
                 r[i] -= &alpha * &Ap[i];
             }
 
-            let rs_new = r.iter().map(|v| v * v).reduce(|a, b| a + b).unwrap();
+            let rs_new = r
+                .iter()
+                .map(|v| (v * v).complete(v.prec()))
+                .reduce(|a, b| a + b)
+                .unwrap();
             if rs_new < Float::with_val(precision, 1e-30) {
                 break;
             }
-            let beta = &rs_new / &rs_old;
+            let beta = (&rs_new / &rs_old).complete(rs_new.prec());
             for i in 0..p.len() {
-                p[i] = &r[i] + &beta * &p[i];
+                p[i] = &r[i] + (&beta * &p[i]).complete(beta.prec());
             }
             rs_old = rs_new;
         }
@@ -429,7 +485,7 @@ impl RugMat {
 
     /// LSQR algorithm to solve A x ≈ b
     pub fn lsqr(&self, b: &[Float], max_iters: usize) -> Vec<Float> {
-        let precision = b[0].precision();
+        let precision = b[0].prec();
         let mut x = vec![Float::with_val(precision, 0); self.cols];
         let mut u = b.to_vec();
         let beta = Self::norm2_vec(&u);
@@ -437,7 +493,7 @@ impl RugMat {
             *ui /= &beta;
         }
 
-        let mut v = Transpose::new(self).mul(&u);
+        let mut v = t!(self).mul(&u);
         let alpha = Self::norm2_vec(&v);
         for vi in &mut v {
             *vi /= &alpha;
@@ -458,7 +514,7 @@ impl RugMat {
             }
             u = u_new;
 
-            let mut v_new = Transpose::new(self).mul(&u);
+            let mut v_new = t!(self).mul(&u);
             for (v_newi, vi) in v_new.iter_mut().zip(&v) {
                 *v_newi -= beta.clone() * vi;
             }
@@ -480,7 +536,7 @@ impl RugMat {
                 x[j] += &phi * &w[j];
             }
             for j in 0..w.len() {
-                w[j] = &v[j] - &theta * &w[j];
+                w[j] = &v[j] - (&theta * &w[j]).complete(theta.prec());
             }
         }
 
@@ -503,10 +559,12 @@ impl RugMat {
             let lambda_new = y
                 .iter()
                 .zip(&y2)
-                .map(|(a, b)| a * b)
+                .map(|(a, b)| (a * b).complete(a.prec()))
                 .reduce(|a, b| a + b)
                 .unwrap();
-            if (&lambda_new - &lambda).abs() < Float::with_val(precision, tol) {
+            if (&lambda_new - &lambda).complete(lambda_new.prec()).abs()
+                < Float::with_val(precision, tol)
+            {
                 return lambda_new;
             }
             lambda.assign(lambda_new);
@@ -521,7 +579,13 @@ impl RugMat {
         let mut lambda = Float::with_val(precision, 0);
 
         for _ in 0..max_iters {
-            let y = self.pseudo_inverse_solve(&x, 20, 0.01);
+            let y = self.pseudo_inverse_solve(
+                &x,
+                20,
+                PseudoInverseAlgorithm::GradientDescent {
+                    alpha: Float::with_val(precision, 1e-3),
+                },
+            );
             let norm_y = Self::norm2_vec(&y);
             for i in 0..self.cols {
                 x[i] = y[i].clone() / &norm_y;
@@ -530,10 +594,12 @@ impl RugMat {
             let lambda_new = x
                 .iter()
                 .zip(&Ax)
-                .map(|(a, b)| a * b)
+                .map(|(a, b)| (a * b).complete(a.prec()))
                 .reduce(|a, b| a + b)
                 .unwrap();
-            if (&lambda_new - &lambda).abs() < Float::with_val(precision, tol) {
+            if (&lambda_new - &lambda).complete(lambda_new.prec()).abs()
+                < Float::with_val(precision, tol)
+            {
                 return lambda_new;
             }
             lambda.assign(lambda_new);
