@@ -2,7 +2,7 @@ use faer::prelude::*;
 use rayon::prelude::*;
 use rug::Assign;
 use rug::Float; // or faer::Mat if needed directly
-use rug::ops::CompleteRound;
+use rug::ops::{CompleteRound, Pow};
 use std::ops::{Index, IndexMut};
 
 pub enum PseudoInverseAlgorithm {
@@ -1210,4 +1210,176 @@ impl RugMat {
     }
 
     */
+    pub fn trace_norm_approx(&self, max_iters: usize, tol: f64, max_singulars: usize) -> Float {
+        let precision = self.data[0].prec();
+        let mut A = self.clone();
+        let mut total = Float::with_val(precision, 0);
+
+        for _ in 0..max_singulars {
+            let sigma = A.spectral_norm_estimate(max_iters, tol);
+            if sigma < Float::with_val(precision, tol) {
+                break;
+            }
+            total += &sigma;
+
+            // Deflate the dominant singular value component
+            // (Not full deflation, approximate)
+            let mut x = vec![Float::with_val(precision, 1); A.cols];
+            for _ in 0..max_iters {
+                let y = A.matmul_vec(&x);
+                let y2 = Transpose::new(&A).mul(&y);
+                let norm = RugMat::norm2_vec(&y2);
+                if norm < Float::with_val(precision, tol) {
+                    break;
+                }
+                for i in 0..x.len() {
+                    x[i] = y2[i].clone() / &norm;
+                }
+            }
+
+            let y = A.matmul_vec(&x);
+            for i in 0..A.rows {
+                for j in 0..A.cols {
+                    let mut temp = (&y[i] * &x[j]).complete(y[i].prec());
+                    temp *= &sigma;
+                    A[(i, j)] -= temp;
+                }
+            }
+        }
+        total
+    }
+
+    pub fn max_entry_norm(&self) -> Float {
+        let precision = self.data[0].prec();
+        let mut max_val = Float::with_val(precision, 0);
+        for j in 0..self.cols {
+            for i in 0..self.rows {
+                let val = self[(i, j)].clone().abs();
+                if val > max_val {
+                    max_val = val;
+                }
+            }
+        }
+        max_val
+    }
+
+    pub fn lp_norm(&self, p: f64, epsilon: Option<f64>) -> Float {
+        assert!(p > 0.0 && p <= 2.0, "Lp norm only defined for p in (0, 2]");
+
+        let precision = self.data[0].prec();
+        let mut acc = Float::with_val(precision * 2, 0);
+        let eps = epsilon.unwrap_or(0.0);
+
+        for j in 0..self.cols {
+            for i in 0..self.rows {
+                let mut val = self[(i, j)].clone().abs();
+                if eps > 0.0 && val < Float::with_val(precision, eps) {
+                    continue;
+                }
+                val = val.pow(p);
+                acc += val;
+            }
+        }
+
+        acc.pow(1.0 / p)
+    }
+
+    pub fn l0_norm(&self) -> usize {
+        let mut count = 0;
+        for j in 0..self.cols {
+            for i in 0..self.rows {
+                if !self[(i, j)].is_zero() {
+                    count += 1;
+                }
+            }
+        }
+        count
+    }
+
+    pub fn frobenius_norm(&self) -> Float {
+        let precision = self.data[0].prec();
+        let mut acc = Float::with_val(precision * 2, 0);
+        for j in 0..self.cols {
+            for i in 0..self.rows {
+                acc += self[(i, j)].clone().square();
+            }
+        }
+        acc.sqrt()
+    }
+
+    /// 1-norm (maximum absolute column sum)
+    pub fn norm1(&self) -> Float {
+        let precision = self.data[0].prec();
+        let mut col_sums = vec![Float::with_val(precision, 0); self.cols];
+
+        for j in 0..self.cols {
+            for i in 0..self.rows {
+                col_sums[j] += self[(i, j)].clone().abs();
+            }
+        }
+
+        col_sums
+            .into_iter()
+            .reduce(|a, b| if a > b { a } else { b })
+            .unwrap()
+    }
+
+    pub fn identity(size: usize, value: Float) -> Self {
+        let mut mat = RugMat::new(size, size, value.prec());
+        for i in 0..size {
+            mat[(i, i)] = value.clone();
+        }
+        mat
+    }
+
+    pub fn diagonal_from_f64(diag: &[f64], precision: u32) -> Self {
+        let mut mat = RugMat::new(diag.len(), diag.len(), precision);
+        for (i, &v) in diag.iter().enumerate() {
+            mat[(i, i)] = Float::with_val(precision, v);
+        }
+        mat
+    }
+
+    pub fn from_vecvec(vecvec: Vec<Vec<Float>>) -> Self {
+        let rows = vecvec.len();
+        let cols = vecvec[0].len();
+        let precision = vecvec[0][0].prec();
+        let mut mat = RugMat::new(rows, cols, precision);
+        for (i, row) in vecvec.into_iter().enumerate() {
+            for (j, val) in row.into_iter().enumerate() {
+                mat[(i, j)] = val;
+            }
+        }
+        mat
+    }
+}
+
+#[test]
+fn test_power_iteration_identity() {
+    let mat = RugMat::identity(5, Float::with_val(128, 1));
+    let sigma = mat.spectral_norm_estimate(100, 1e-20);
+    assert!(sigma.to_f64() - 1.0 < 1e-10);
+}
+
+#[test]
+fn test_power_iteration_diagonal() {
+    let diag_values = vec![1.0, 2.0, 0.5, 4.0, 3.0];
+    let mat = RugMat::diagonal_from_f64(&diag_values, 128);
+    let sigma = mat.spectral_norm_estimate(100, 1e-20);
+    assert!((sigma.to_f64() - 4.0).abs() < 1e-10);
+}
+
+#[test]
+fn test_norms_simple_matrix() {
+    let data = vec![
+        vec![Float::with_val(128, 1), Float::with_val(128, 2)],
+        vec![Float::with_val(128, 3), Float::with_val(128, 4)],
+    ];
+    let mat = RugMat::from_vecvec(data);
+
+    let norm1 = mat.norm1();
+    let norm_inf = mat.norm_inf();
+
+    assert!((norm1.to_f64() - 6.0).abs() < 1e-10); // max column sum
+    assert!((norm_inf.to_f64() - 7.0).abs() < 1e-10); // max row sum
 }
