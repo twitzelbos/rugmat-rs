@@ -1324,8 +1324,9 @@ impl RugMat {
             .unwrap()
     }
 
-    pub fn identity(size: usize, value: Float) -> Self {
-        let mut mat = RugMat::new(size, size, value.prec());
+    pub fn identity(size: usize, precision: u32) -> Self {
+        let value = Float::with_val(precision, 1);
+        let mut mat = RugMat::new(size, size, precision);
         for i in 0..size {
             mat[(i, i)] = value.clone();
         }
@@ -1356,7 +1357,7 @@ impl RugMat {
 
 #[test]
 fn test_power_iteration_identity() {
-    let mat = RugMat::identity(5, Float::with_val(128, 1));
+    let mat = RugMat::identity(5, 128);
     let sigma = mat.spectral_norm_estimate(100, 1e-20);
     assert!(sigma.to_f64() - 1.0 < 1e-10);
 }
@@ -1382,4 +1383,92 @@ fn test_norms_simple_matrix() {
 
     assert!((norm1.to_f64() - 6.0).abs() < 1e-10); // max column sum
     assert!((norm_inf.to_f64() - 7.0).abs() < 1e-10); // max row sum
+}
+
+#[test]
+fn test_matmul_identity() {
+    let precision = 128;
+    let mat = RugMat::from_vecvec(vec![
+        vec![Float::with_val(precision, 1), Float::with_val(precision, 2)],
+        vec![Float::with_val(precision, 3), Float::with_val(precision, 4)],
+    ]);
+    let id = RugMat::identity(2, precision);
+    let result = mat.matmul(&id);
+    for i in 0..2 {
+        for j in 0..2 {
+            assert!(
+                (result[(i, j)].clone() - mat[(i, j)].clone()).abs()
+                    < Float::with_val(precision, 1e-20)
+            );
+        }
+    }
+}
+
+#[test]
+fn test_matmul_vec_identity() {
+    let precision = 128;
+    let id = RugMat::identity(3, precision);
+    let vec = vec![
+        Float::with_val(precision, 1),
+        Float::with_val(precision, 2),
+        Float::with_val(precision, 3),
+    ];
+    let result = id.matmul_vec(&vec);
+    for i in 0..3 {
+        assert!((result[i].clone() - vec[i].clone()).abs() < Float::with_val(precision, 1e-20));
+    }
+}
+
+#[test]
+fn test_matmul_known() {
+    let precision = 128;
+    let a = RugMat::from_vecvec(vec![
+        vec![Float::with_val(precision, 1), Float::with_val(precision, 2)],
+        vec![Float::with_val(precision, 0), Float::with_val(precision, 1)],
+    ]);
+    let b = RugMat::from_vecvec(vec![
+        vec![Float::with_val(precision, 3), Float::with_val(precision, 4)],
+        vec![Float::with_val(precision, 5), Float::with_val(precision, 6)],
+    ]);
+    let result = a.matmul(&b);
+
+    let expected = vec![
+        vec![
+            Float::with_val(precision, 13), // 1*3 + 2*5
+            Float::with_val(precision, 16), // 1*4 + 2*6
+        ],
+        vec![
+            Float::with_val(precision, 5), // 0*3 + 1*5
+            Float::with_val(precision, 6), // 0*4 + 1*6
+        ],
+    ];
+    for i in 0..2 {
+        for j in 0..2 {
+            assert!(
+                (result[(i, j)].clone() - expected[i][j].clone()).abs()
+                    < Float::with_val(precision, 1e-20)
+            );
+        }
+    }
+}
+
+#[test]
+fn test_matmul_vec_known() {
+    let precision = 128;
+    let mat = RugMat::from_vecvec(vec![
+        vec![Float::with_val(precision, 2), Float::with_val(precision, 0)],
+        vec![Float::with_val(precision, 1), Float::with_val(precision, 3)],
+    ]);
+    let vec = vec![Float::with_val(precision, 1), Float::with_val(precision, 2)];
+    let result = mat.matmul_vec(&vec);
+
+    let expected = vec![
+        Float::with_val(precision, 2), // 2*1 + 0*2
+        Float::with_val(precision, 7), // 1*1 + 3*2
+    ];
+    for i in 0..2 {
+        assert!(
+            (result[i].clone() - expected[i].clone()).abs() < Float::with_val(precision, 1e-20)
+        );
+    }
 }
