@@ -1366,7 +1366,8 @@ fn test_power_iteration_identity() {
 fn test_power_iteration_diagonal() {
     let diag_values = vec![1.0, 2.0, 0.5, 4.0, 3.0];
     let mat = RugMat::diagonal_from_f64(&diag_values, 128);
-    let sigma = mat.spectral_norm_estimate(100, 1e-20);
+    let sigma = mat.spectral_norm_estimate(500, 1e-20);
+    println!("Sigma: {}", sigma);
     assert!((sigma.to_f64() - 4.0).abs() < 1e-10);
 }
 
