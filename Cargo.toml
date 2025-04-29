@@ -2,6 +2,7 @@
 name = "rugmat"
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
 
 [dependencies]
 rug = "1.21"
